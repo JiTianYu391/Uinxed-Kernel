@@ -110,11 +110,17 @@ void plogk(const char *format, ...)
 #if KERNEL_LOG
     if (!format || 6 > console_loglevel) return;
     spin_lock(&plogk_lock); // Lock
-    printk("[%5d.%06d] ", nano_time() / 1000000000, (nano_time() / 1000) % 1000000);
+    char buf[BUF_SIZE];
+    int  n = snprintf(buf, sizeof(buf), "[%5d.%06d] ", (int)(nano_time() / 1000000000), (int)((nano_time() / 1000) % 1000000));
+    if (n < 0 || (size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
     va_list args;
     va_start(args, format);
-    vwprintf(&klog_writer, format, args);
+    int m = vsnprintf(buf + n, sizeof(buf) - (size_t)n, format, args);
     va_end(args);
+    if (m < 0) m = 0;
+    if ((size_t)(n + m) >= sizeof(buf)) m = (int)sizeof(buf) - 1 - n;
+    if (m && buf[n + m - 1] != '\n' && (size_t)(n + m) < sizeof(buf) - 1) buf[n + m++] = '\n';
+    printk_emit(6, buf, (size_t)(n + m));
     spin_unlock(&plogk_lock); // Unlock
 #else
     (void)format;
