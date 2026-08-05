@@ -12,6 +12,7 @@
 #include <drivers/char/tty.h>
 #include <kernel/uinxed.h>
 #include <libs/gfxs/bmp.h>
+#include <video/fbcon.h>
 #include <video/klogo.h>
 #include <video/video.h>
 
@@ -50,6 +51,18 @@ void video_redraw_logo(void)
 void video_clear_logo(void)
 {
     video_draw_rect((position_t) {0, 0}, (position_t) {width - 1, KLOGO_AREA_HEIGHT - 1}, 0x00000000);
+}
+
+/* Remove the boot logo overlay: blank its area and hand the full
+ * framebuffer to the console.  Called when userland takes over. */
+void video_remove_boot_logo(void)
+{
+#if BOOT_LOGO
+    if (!saved_logo_count) return;
+    video_clear_logo();
+    saved_logo_count = 0;
+    fbcon_set_logo_reserve(false);
+#endif
 }
 
 void video_show_boot_logo(void)

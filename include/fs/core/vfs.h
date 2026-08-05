@@ -174,6 +174,7 @@ typedef struct vfs_node {
         uint16_t             mode;         // Mode
         uint16_t             fsid;         // File system mount ID
         void                *handle;       // Handle to the file
+        void                *mount_saved_handle; // Handle of the underlying fs, saved at mount time
         uint64_t             flags;        // File flags
         clist_t              child;        // Child nodes
         vfs_node_t           root;         // Root directory

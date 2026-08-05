@@ -36,8 +36,8 @@ void dump_stack(void)
     uintptr_t rip;
     __asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
 
-    plogk("Call Trace:\n");
-    plogk(" <TASK>\n");
+    printk("Call Trace:\n");
+    printk(" <TASK>\n");
 
     int frame_count = 0;
     for (int i = 0; i < 16; ++i) {
@@ -59,12 +59,12 @@ void dump_stack(void)
         if (rip >= KERNEL_BASE_ADDRESS) {
             sym_info_t sym_info = get_symbol_info(kernel_file_request.response->kernel_file->address, rip);
             if (sym_info.name) {
-                plogk("  [<0x%016zx>] `%s`+0x%lx/0x%lx\n", rip, sym_info.name, rip - current_address, sym_info.size);
+                printk("  [<0x%016zx>] `%s`+0x%lx/0x%lx\n", rip, sym_info.name, rip - current_address, sym_info.size);
             } else {
-                plogk("  [<0x%016zx>] %s\n", rip, "unknown");
+                printk("  [<0x%016zx>] %s\n", rip, "unknown");
             }
         } else {
-            plogk("  [<0x%016zx>] %s\n", rip, "unknown");
+            printk("  [<0x%016zx>] %s\n", rip, "unknown");
             break;
         }
 
@@ -72,7 +72,7 @@ void dump_stack(void)
         rbp = rbp->next;
         ++frame_count;
     }
-    plogk(" </TASK>\n");
+    printk(" </TASK>\n");
 }
 
 /* Kernel panic */
@@ -94,16 +94,16 @@ void panic(const char *format, ...)
 
     if (i < 0 || (size_t)i >= sizeof(buff)) buff[sizeof(buff) - 1] = '\0';
 
-    plogk("\n");
-    plogk("Kernel panic - not syncing: %s\n", buff);
+    printk("\n");
+    pr_emerg("Kernel panic - not syncing: %s\n", buff);
     task_t     *panic_task = current_task();
     int         panic_pid  = panic_task ? (int)panic_task->pid : -1;
     const char *panic_comm = panic_task ? panic_task->name : "unknown";
-    plogk("CPU: %d PID: %d Comm: %s Not tainted\n", get_current_cpu_id(), panic_pid, panic_comm);
-    plogk("Hardware name: %s %s, BIOS %s %s\n", sys_vendor, sys_product, bios_version, bios_date);
+    pr_emerg("CPU: %d PID: %d Comm: %s Not tainted\n", get_current_cpu_id(), panic_pid, panic_comm);
+    pr_emerg("Hardware name: %s %s, BIOS %s %s\n", sys_vendor, sys_product, bios_version, bios_date);
     dump_stack();
-    plogk("Kernel Offset: 0x%08x from %p\n", current_address - KERNEL_BASE_ADDRESS, KERNEL_BASE_ADDRESS);
-    plogk("---[ end Kernel panic - not syncing: %s ]---", buff);
+    pr_emerg("Kernel Offset: 0x%08x from %p\n", current_address - KERNEL_BASE_ADDRESS, KERNEL_BASE_ADDRESS);
+    pr_emerg("---[ end Kernel panic - not syncing: %s ]---", buff);
     tty_buff_flush();
     krn_halt();
 }

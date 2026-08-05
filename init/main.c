@@ -62,6 +62,7 @@
 #include <kernel/elf_loader.h>
 #include <kernel/errno.h>
 #include <kernel/interrupt.h>
+#include <kernel/kmsg.h>
 #include <kernel/module.h>
 #include <kernel/printk.h>
 #include <kernel/uinxed.h>
@@ -124,6 +125,9 @@ void swapper_run_init(void)
         if (cpu_rqs[i].idle) cpu_rqs[i].idle->process = init;
     }
     plogk("swapper/0: Init process (pid=1) ready.\n");
+    /* Userland takes over the screen: drop the boot logo and let the
+     * console use the full framebuffer. */
+    video_remove_boot_logo();
     video_start_refresh_worker();
 }
 
@@ -163,6 +167,7 @@ void kernel_entry(void)
     init_frame();           // Physical Memory Frame
     page_init();            // Standard 4-Level Page Table
     init_heap();            // Standard Memory Heap
+    kmsg_init();            // Kernel message ring buffer (syslog, /dev/kmsg)
     swap_init();            // Anonymous-memory swap area manager
     lmodule_init();         // Limine Kernel Module
                             //

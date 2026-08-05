@@ -50,33 +50,117 @@ static process_t *process_table[PROCESS_TABLE_SIZE];
 static spinlock_t process_table_lock;
 process_t        *init_process;
 
+/* PIDs grow monotonically; once PID_MAX is exhausted the direct table can no
+ * longer hold new processes.  Keep a spill list so kill/wait/ptrace and
+ * process iteration keep working instead of silently dropping the pid. */
+typedef struct process_overflow_entry {
+        struct process_overflow_entry *next;
+        process_t                     *proc;
+} process_overflow_entry_t;
+
+static process_overflow_entry_t *process_overflow_list;
+
+static void process_overflow_add(pid_t pid, process_t *proc)
+{
+    (void)pid;
+    process_overflow_entry_t *entry = malloc(sizeof(*entry));
+    if (!entry) return;
+    entry->proc             = proc;
+    entry->next             = process_overflow_list;
+    process_overflow_list = entry;
+}
+
+static void process_overflow_remove(pid_t pid, process_t *proc)
+{
+    (void)pid;
+    process_overflow_entry_t **link = &process_overflow_list;
+    while (*link) {
+        if ((*link)->proc == proc) {
+            process_overflow_entry_t *dead = *link;
+            *link                          = dead->next;
+            free(dead);
+            return;
+        }
+        link = &(*link)->next;
+    }
+}
+
 static process_t *pid_to_process(pid_t pid)
 {
-    if (pid <= 0 || pid >= PROCESS_TABLE_SIZE) return NULL;
+    if (pid <= 0) return NULL;
     spin_lock(&process_table_lock);
-    process_t *proc = process_table[pid];
+    process_t *proc = NULL;
+    if (pid < PROCESS_TABLE_SIZE)
+        proc = process_table[pid];
+    else
+        for (process_overflow_entry_t *entry = process_overflow_list; entry; entry = entry->next)
+            if (entry->proc && entry->proc->task && entry->proc->task->pid == (uint64_t)pid) {
+                proc = entry->proc;
+                break;
+            }
     spin_unlock(&process_table_lock);
     return proc;
 }
 
 static process_t *pid_to_process_locked(pid_t pid)
 {
-    if (pid <= 0 || pid >= PROCESS_TABLE_SIZE) return NULL;
-    return process_table[pid];
+    if (pid <= 0) return NULL;
+    if (pid < PROCESS_TABLE_SIZE) return process_table[pid];
+    for (process_overflow_entry_t *entry = process_overflow_list; entry; entry = entry->next)
+        if (entry->proc && entry->proc->task && entry->proc->task->pid == (uint64_t)pid) return entry->proc;
+    return NULL;
 }
 
 static void pid_set(pid_t pid, process_t *proc)
 {
-    if (pid <= 0 || pid >= PROCESS_TABLE_SIZE) return;
+    if (pid <= 0) return;
     spin_lock(&process_table_lock);
-    process_table[pid] = proc;
+    if (pid < PROCESS_TABLE_SIZE)
+        process_table[pid] = proc;
+    else if (proc)
+        process_overflow_add(pid, proc);
+    else {
+        process_t *victim = pid_to_process_locked(pid);
+        if (victim) process_overflow_remove(pid, victim);
+    }
     spin_unlock(&process_table_lock);
 }
 
 static void pid_set_locked(pid_t pid, process_t *proc)
 {
-    if (pid <= 0 || pid >= PROCESS_TABLE_SIZE) return;
-    process_table[pid] = proc;
+    if (pid <= 0) return;
+    if (pid < PROCESS_TABLE_SIZE)
+        process_table[pid] = proc;
+    else if (proc)
+        process_overflow_add(pid, proc);
+    else {
+        process_t *victim = pid_to_process_locked(pid);
+        if (victim) process_overflow_remove(pid, victim);
+    }
+}
+
+/* Unified iteration over the direct table followed by the overflow list.
+ * Caller must hold process_table_lock. */
+static process_t *process_next_locked(size_t *pos)
+{
+    if (!pos) return NULL;
+    if (*pos < PROCESS_TABLE_SIZE) {
+        for (; *pos < PROCESS_TABLE_SIZE; (*pos)++) {
+            process_t *proc = process_table[*pos];
+            if (proc) {
+                (*pos)++;
+                return proc;
+            }
+        }
+    }
+    size_t index = *pos >= PROCESS_TABLE_SIZE ? *pos - PROCESS_TABLE_SIZE : 0;
+    for (process_overflow_entry_t *entry = process_overflow_list; entry; entry = entry->next) {
+        if (index++ == 0) {
+            (*pos)++;
+            return entry->proc;
+        }
+    }
+    return NULL;
 }
 
 static void process_free(process_t *proc);
@@ -111,26 +195,18 @@ process_t *process_iterate_get(size_t *pos)
     if (!pos) return NULL;
 
     spin_lock(&process_table_lock);
-    for (; *pos < PROCESS_TABLE_SIZE; (*pos)++) {
-        process_t *proc = process_table[*pos];
-        if (proc) {
-            (*pos)++;
-            process_get_locked(proc);
-            spin_unlock(&process_table_lock);
-            return proc;
-        }
-    }
+    process_t *proc = process_next_locked(pos);
+    if (proc) process_get_locked(proc);
     spin_unlock(&process_table_lock);
-    return NULL;
+    return proc;
 }
 
 void process_debug_dump_tasks(void)
 {
     spin_lock(&process_table_lock);
     plogk("task-dump: begin\n");
-    for (size_t i = 1; i < PROCESS_TABLE_SIZE; i++) {
-        process_t *proc = process_table[i];
-        if (!proc) continue;
+    size_t pos = 1;
+    for (process_t *proc = process_next_locked(&pos); proc; proc = process_next_locked(&pos)) {
         for (ilist_node_t *node = proc->threads.next; node != &proc->threads; node = node->next) {
             task_t *task = rb_entry(node, task_t, thread_node);
             if (task->state == TASK_ZOMBIE) continue;
@@ -147,10 +223,8 @@ process_t *process_group_iterate_get(size_t *pos, pid_t pgid, pid_t sid)
     if (!pos || pgid <= 0) return NULL;
 
     spin_lock(&process_table_lock);
-    for (; *pos < PROCESS_TABLE_SIZE; (*pos)++) {
-        process_t *proc = process_table[*pos];
-        if (proc && proc->pgid == pgid && (sid <= 0 || proc->sid == sid)) {
-            (*pos)++;
+    for (process_t *proc = process_next_locked(pos); proc; proc = process_next_locked(pos)) {
+        if (proc->pgid == pgid && (sid <= 0 || proc->sid == sid)) {
             process_get_locked(proc);
             spin_unlock(&process_table_lock);
             return proc;
@@ -206,9 +280,9 @@ static void process_ctty_clear_matching(tty_core_t *tty, pid_t sid, bool match_s
     for (;;) {
         tty_core_t *release = NULL;
         spin_lock(&process_table_lock);
-        for (size_t i = 0; i < PROCESS_TABLE_SIZE; i++) {
-            process_t *proc = process_table[i];
-            if (proc && proc->controlling_tty == tty && (!match_session || proc->sid == sid)) {
+        size_t pos = 1;
+        for (process_t *proc = process_next_locked(&pos); proc; proc = process_next_locked(&pos)) {
+            if (proc->controlling_tty == tty && (!match_session || proc->sid == sid)) {
                 proc->controlling_tty = NULL;
                 release               = tty;
                 break;
@@ -253,9 +327,9 @@ bool process_pgrp_in_session(pid_t pgid, pid_t sid)
     bool found = false;
 
     spin_lock(&process_table_lock);
-    for (size_t i = 0; i < PROCESS_TABLE_SIZE; i++) {
-        process_t *proc = process_table[i];
-        if (proc && proc->pgid == pgid && proc->sid == sid) {
+    size_t pos = 1;
+    for (process_t *proc = process_next_locked(&pos); proc; proc = process_next_locked(&pos)) {
+        if (proc->pgid == pgid && proc->sid == sid) {
             found = true;
             break;
         }
@@ -276,9 +350,9 @@ int process_ctty_set_foreground(tty_core_t *tty, pid_t sid, pid_t pgid)
         return -ENOTTY;
     }
     bool found = false;
-    for (size_t i = 0; i < PROCESS_TABLE_SIZE; i++) {
-        process_t *proc = process_table[i];
-        if (proc && proc->pgid == pgid && proc->sid == sid) {
+    size_t pos = 1;
+    for (process_t *proc = process_next_locked(&pos); proc; proc = process_next_locked(&pos)) {
+        if (proc->pgid == pgid && proc->sid == sid) {
             found = true;
             break;
         }

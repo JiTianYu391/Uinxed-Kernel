@@ -34,6 +34,9 @@ void video_redraw_logo(void);
 /* Clean the kernel logo */
 void video_clear_logo(void);
 
+/* Remove the boot logo overlay and give the console the full screen */
+void video_remove_boot_logo(void);
+
 /* Show boot logo (determines CPU count, checks TTY type internally) */
 void video_show_boot_logo(void);
 

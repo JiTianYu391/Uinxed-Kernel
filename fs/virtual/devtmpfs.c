@@ -24,6 +24,7 @@
 #include <fs/virtual/tmpfs.h>
 #include <kernel/audio.h>
 #include <kernel/errno.h>
+#include <kernel/kmsg.h>
 #include <kernel/printk.h>
 #include <libs/std/string.h>
 #include <mem/alloc.h>
@@ -136,17 +137,44 @@ static int64_t devtmpfs_memory_write(void *context, void *private_data, uint64_t
     return device->kind == DEVTMPFS_MEM_FULL ? -ENOSPC : (int64_t)size;
 }
 
+/* /dev/kmsg: Linux devkmsg interface.  Each open gets a private cursor;
+ * reads stream records in "<level>,<seq>,<ts_usec>,<flags>;text\n" format
+ * starting from the oldest record, writes inject new records. */
+typedef struct {
+        uint64_t cursor;
+} devtmpfs_kmsg_reader_t;
+
+static int devtmpfs_kmsg_open(vfs_node_t node, uint64_t flags, void **private_data)
+{
+    (void)node;
+    (void)flags;
+    devtmpfs_kmsg_reader_t *reader = malloc(sizeof(devtmpfs_kmsg_reader_t));
+    if (!reader) return -ENOMEM;
+    reader->cursor = kmsg_first_seq();
+    *private_data  = reader;
+    return 0;
+}
+
+static void devtmpfs_kmsg_release(vfs_node_t node, void *private_data)
+{
+    (void)node;
+    free(private_data);
+}
+
 static int64_t devtmpfs_kmsg_read(void *context, void *private_data, uint64_t flags, void *buffer, size_t offset, size_t size)
 {
     (void)context;
-    (void)private_data;
     (void)flags;
-    (void)buffer;
     (void)offset;
-    (void)size;
-    /* The kernel currently exposes printk output through its consoles.  A
-     * nonblocking kmsg reader observes no queued record rather than EOF. */
-    return -EAGAIN;
+    devtmpfs_kmsg_reader_t *reader = private_data;
+    if (!buffer && size) return -EINVAL;
+    if (!size) return 0;
+    if (!reader) return -EINVAL;
+
+    uint64_t next = reader->cursor;
+    ssize_t  n    = kmsg_dev_read(reader->cursor, buffer, size, &next);
+    if (n > 0) reader->cursor = next;
+    return (int64_t)n;
 }
 
 static int64_t devtmpfs_kmsg_write(void *context, void *private_data, uint64_t flags, const void *buffer, size_t offset, size_t size)
@@ -155,23 +183,7 @@ static int64_t devtmpfs_kmsg_write(void *context, void *private_data, uint64_t f
     (void)private_data;
     (void)flags;
     (void)offset;
-    if (!buffer && size) return -EINVAL;
-    if (!size) return 0;
-
-    char *message = malloc(size + 1);
-    if (!message) return -ENOMEM;
-    memcpy(message, buffer, size);
-    message[size] = '\0';
-    /* /dev/kmsg writers may prefix a syslog priority as "<n>".  The console
-     * backend has no severity lanes yet, but should not print that framing. */
-    char *text = message;
-    if (text[0] == '<') {
-        char *end = strchr(text, '>');
-        if (end && (size_t)(end - text) <= 4) text = end + 1;
-    }
-    printk("%s", text);
-    free(message);
-    return (int64_t)size;
+    return kmsg_dev_write(buffer, size);
 }
 
 static void devtmpfs_table_init(void)
@@ -573,6 +585,8 @@ static int devtmpfs_create_kmsg_node(void)
     tmpfs_device_ops_t ops = {
         .file_read  = devtmpfs_kmsg_read,
         .file_write = devtmpfs_kmsg_write,
+        .open       = devtmpfs_kmsg_open,
+        .release    = devtmpfs_kmsg_release,
     };
     uint64_t devt = MKDEV(1, 11);
     int      ret  = devtmpfs_register_char_device("/dev/kmsg", devt, devt, file_stream, &ops);

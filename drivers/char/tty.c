@@ -10,6 +10,7 @@
 
 #include <drivers/char/tty.h>
 #include <drivers/char/tty_core.h>
+#include <drivers/input/input_event.h>
 #include <drivers/ports/serial.h>
 #include <fs/core/vfs.h>
 #include <kernel/cmdline.h>
@@ -407,9 +408,15 @@ size_t tty_dev_write(void *ctx, const void *addr, size_t offset, size_t size)
     return result < 0 ? 0 : (size_t)result;
 }
 
-static bool tty_shift_pressed = false;
-static bool tty_ctrl_pressed  = false;
-static bool tty_caps_active   = false;
+static bool tty_shift_pressed  = false;
+static bool tty_ctrl_pressed   = false;
+static bool tty_caps_active    = false;
+static bool tty_numlock_active = false;
+
+static void tty_emit_seq(const char *seq, size_t len)
+{
+    tty_core_receive(&console_tty, (const uint8_t *)seq, len, O_NONBLOCK);
+}
 
 /*
  * US QWERTY keymap (Set? scancode ?ASCII).
@@ -433,27 +440,34 @@ static const unsigned char tty_keymap_shift[128] = {
     'M', '<', '>', '?', 0,   '*', 0,   ' ', 0,        /* 50-58 */
 };
 
-/* Feed a scancode into the TTY line discipline */
+/* Feed a Linux input keycode (from the keyboard driver) into the TTY line
+ * discipline.  The main typing block numerically matches set-1 scancodes,
+ * so printable keys are looked up in the keymap; navigation, function and
+ * keypad keys are translated to ANSI escape sequences. */
 void tty_handle_scancode(uint8_t scancode, bool pressed)
 {
     tty_input_lazy_init();
     if (tty_core_keyboard_mode(&console_tty) == K_OFF) return;
 
-    /* Track modifier keys */
+    /* Track modifier and lock keys */
     switch (scancode) {
-        case 42 : /* LSHIFT */
-        case 54 : /* RSHIFT */
+        case KEY_LEFTSHIFT :
+        case KEY_RIGHTSHIFT :
             tty_shift_pressed = pressed;
             return;
-        case 29 : /* LCTRL */
-        case 97 : /* RCTRL */
+        case KEY_LEFTCTRL :
+        case KEY_RIGHTCTRL :
             tty_ctrl_pressed = pressed;
             return;
-        case 58 : /* CAPSLOCK */
+        case KEY_CAPSLOCK :
             if (pressed) tty_caps_active = !tty_caps_active;
             return;
-        case 56 :  /* LALT */
-        case 100 : /* RALT */
+        case KEY_NUMLOCK :
+            if (pressed) tty_numlock_active = !tty_numlock_active;
+            return;
+        case KEY_LEFTALT :  /* LALT */
+        case KEY_RIGHTALT : /* RALT */
+        case KEY_SCROLLLOCK :
             return;
         default :
             break;
@@ -466,21 +480,185 @@ void tty_handle_scancode(uint8_t scancode, bool pressed)
 
     /* Handle special (non-printable) keys */
     switch (scancode) {
-        case 14 : /* BACKSPACE */
+        case KEY_BACKSPACE : /* BACKSPACE */
             ch = '\b';
             break;
-        case 28 : /* ENTER - send CR; canonical mode converts to LF via ICRNL */
+        case KEY_ENTER :    /* ENTER - send CR; canonical mode converts to LF via ICRNL */
+        case KEY_KPENTER :  /* Numpad Enter */
             ch = '\r';
             break;
-        case 15 : /* TAB */
+        case KEY_TAB : /* TAB */
             ch = '\t';
             break;
-        case 57 : /* SPACE */
+        case KEY_SPACE : /* SPACE */
             ch = ' ';
             break;
-        case 1 : /* ESC */
+        case KEY_ESC : /* ESC */
             ch = 0x1B;
             break;
+
+        /* Cursor / navigation keys -> ANSI CSI/SS3 sequences */
+        case KEY_UP :
+            tty_emit_seq("\x1b[A", 3);
+            return;
+        case KEY_DOWN :
+            tty_emit_seq("\x1b[B", 3);
+            return;
+        case KEY_RIGHT :
+            tty_emit_seq("\x1b[C", 3);
+            return;
+        case KEY_LEFT :
+            tty_emit_seq("\x1b[D", 3);
+            return;
+        case KEY_HOME :
+            tty_emit_seq("\x1b[H", 3);
+            return;
+        case KEY_END :
+            tty_emit_seq("\x1b[F", 3);
+            return;
+        case KEY_PAGEUP :
+            tty_emit_seq("\x1b[5~", 4);
+            return;
+        case KEY_PAGEDOWN :
+            tty_emit_seq("\x1b[6~", 4);
+            return;
+        case KEY_INSERT :
+            tty_emit_seq("\x1b[2~", 4);
+            return;
+        case KEY_DELETE :
+            tty_emit_seq("\x1b[3~", 4);
+            return;
+
+        /* Function keys F1-F12 */
+        case KEY_F1 :
+            tty_emit_seq("\x1bOP", 3);
+            return;
+        case KEY_F2 :
+            tty_emit_seq("\x1bOQ", 3);
+            return;
+        case KEY_F3 :
+            tty_emit_seq("\x1bOR", 3);
+            return;
+        case KEY_F4 :
+            tty_emit_seq("\x1bOS", 3);
+            return;
+        case KEY_F5 :
+            tty_emit_seq("\x1b[15~", 5);
+            return;
+        case KEY_F6 :
+            tty_emit_seq("\x1b[17~", 5);
+            return;
+        case KEY_F7 :
+            tty_emit_seq("\x1b[18~", 5);
+            return;
+        case KEY_F8 :
+            tty_emit_seq("\x1b[19~", 5);
+            return;
+        case KEY_F9 :
+            tty_emit_seq("\x1b[20~", 5);
+            return;
+        case KEY_F10 :
+            tty_emit_seq("\x1b[21~", 5);
+            return;
+        case KEY_F11 :
+            tty_emit_seq("\x1b[23~", 5);
+            return;
+        case KEY_F12 :
+            tty_emit_seq("\x1b[24~", 5);
+            return;
+
+        /* Keypad.  With NumLock on the digit keys emit digits, otherwise the
+         * keyboard controller reports them as navigation keys; keep explicit
+         * fallbacks here for keyboards that always report numpad codes. */
+        case KEY_KPSLASH :
+            ch = '/';
+            break;
+        case KEY_KPASTERISK :
+            ch = '*';
+            break;
+        case KEY_KPMINUS :
+            ch = '-';
+            break;
+        case KEY_KPPLUS :
+            ch = '+';
+            break;
+        case KEY_KPDOT :
+            if (tty_numlock_active) {
+                ch = '.';
+                break;
+            }
+            tty_emit_seq("\x1b[3~", 4); /* Delete */
+            return;
+        case KEY_KP0 :
+            if (tty_numlock_active) {
+                ch = '0';
+                break;
+            }
+            tty_emit_seq("\x1b[2~", 4); /* Insert */
+            return;
+        case KEY_KP1 :
+            if (tty_numlock_active) {
+                ch = '1';
+                break;
+            }
+            tty_emit_seq("\x1b[F", 3); /* End */
+            return;
+        case KEY_KP2 :
+            if (tty_numlock_active) {
+                ch = '2';
+                break;
+            }
+            tty_emit_seq("\x1b[B", 3); /* Down */
+            return;
+        case KEY_KP3 :
+            if (tty_numlock_active) {
+                ch = '3';
+                break;
+            }
+            tty_emit_seq("\x1b[6~", 4); /* PageDown */
+            return;
+        case KEY_KP4 :
+            if (tty_numlock_active) {
+                ch = '4';
+                break;
+            }
+            tty_emit_seq("\x1b[D", 3); /* Left */
+            return;
+        case KEY_KP5 :
+            if (tty_numlock_active) {
+                ch = '5';
+                break;
+            }
+            return;
+        case KEY_KP6 :
+            if (tty_numlock_active) {
+                ch = '6';
+                break;
+            }
+            tty_emit_seq("\x1b[C", 3); /* Right */
+            return;
+        case KEY_KP7 :
+            if (tty_numlock_active) {
+                ch = '7';
+                break;
+            }
+            tty_emit_seq("\x1b[H", 3); /* Home */
+            return;
+        case KEY_KP8 :
+            if (tty_numlock_active) {
+                ch = '8';
+                break;
+            }
+            tty_emit_seq("\x1b[A", 3); /* Up */
+            return;
+        case KEY_KP9 :
+            if (tty_numlock_active) {
+                ch = '9';
+                break;
+            }
+            tty_emit_seq("\x1b[5~", 4); /* PageUp */
+            return;
+
         default :
             /* Translate printable keys via keymap */
             if (scancode >= 128) return;

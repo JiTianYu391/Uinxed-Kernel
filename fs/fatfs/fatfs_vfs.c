@@ -78,7 +78,17 @@ static void fatfs_handle_destroy(fatfs_handle_t *handle)
 
     free(handle->path);
     if (handle->owns_mount && handle->mount) {
+        uint8_t drive = (uint8_t)(handle->mount->drive[0] - '0');
+
         f_unmount(handle->mount->drive);
+        /* Release the logical volume so the drive slot can be reused by a
+         * later mount.  Without this every mount/umount cycle orphans one of
+         * the FF_VOLUMES slots and remount eventually fails with -ENOSPC. */
+        if (drive < FF_VOLUMES) {
+            fatfs_unbind_device(drive);
+            VolToPart[drive].pd = 0;
+            VolToPart[drive].pt = 0;
+        }
         free(handle->mount);
     }
     free(handle);

@@ -8,6 +8,7 @@
  *
  */
 
+#include <drivers/char/tty.h>
 #include <drivers/input/evdev.h>
 #include <drivers/usb/class/usb_hid.h>
 #include <drivers/usb/core/usb.h>
@@ -216,6 +217,9 @@ static void hid_interrupt_complete(usb_endpoint_t *endpoint, const void *data, s
         usb_hid_event_t *event = &events[i];
         if (event->application >= hid->application_count || !hid->input[event->application]) continue;
         evdev_inject_event(hid->input[event->application], event->type, event->code, event->value);
+        if (event->type == EV_KEY && event->code && event->code <= 0xff
+            && hid->report.applications[event->application].usage_page == 0x07)
+            tty_handle_scancode((uint8_t)event->code, event->value != 0);
         touched[event->application] = true;
     }
     for (size_t i = 0; i < hid->application_count; i++)

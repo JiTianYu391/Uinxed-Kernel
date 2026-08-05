@@ -123,8 +123,11 @@ int virtgpu_gem_dumb_create(struct drm_file *file_priv, struct drm_device *dev, 
     if (args->width > dev->mode_config.max_width || args->height > dev->mode_config.max_height) return -EINVAL;
     if (args->width > UINT32_MAX / 4) return -EINVAL;
 
-    /* Round up pitch to alignment */
-    args->pitch = ALIGN_UP(args->width * (args->bpp / 8), VIRTGPU_STRIDE_ALIGN);
+    /* The host walks the backing buffer with a tight stride of
+     * width * bpp/8 (QEMU: host_stride = width * 4). Aligning the
+     * pitch to 64 bytes would shear the image whenever width * 4 is
+     * not 64-aligned, so report the exact host stride. */
+    args->pitch = args->width * (args->bpp / 8);
     args->size  = (uint64_t)args->pitch * args->height;
     size        = args->size;
 

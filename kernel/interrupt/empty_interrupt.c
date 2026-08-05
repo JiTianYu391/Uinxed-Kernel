@@ -12,13 +12,16 @@
 #include <drivers/interrupt/apic.h>
 #include <kernel/interrupt.h>
 #include <kernel/printk.h>
+#include <libs/std/stdbool.h>
 
 #define INTERRUPT_HANDLE(id)                                                 \
     INTERRUPT_BEGIN static void empty_handler_##id(interrupt_frame_t *frame) \
     {                                                                        \
         (void)frame;                                                         \
         disable_intr();                                                      \
-        plogk("Interrupt empty %u\n", id);                                   \
+        /* Spurious/unhandled IRQs can fire continuously; log once so a      \
+         * storm does not flood the console. */                              \
+        printk_once(KERN_WARNING "Interrupt empty %u\n", id);                \
         send_eoi();                                                          \
         enable_intr();                                                       \
     }                                                                        \

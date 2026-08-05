@@ -37,7 +37,16 @@ static inline int user_exception(interrupt_frame_t *frame, int sig, int code, co
             info.si_code   = code;
             info.si_addr   = (void *)frame->rip;
 
-            plogk("%s (pid=%llu): %s\n", name, proc->task->pid, msg);
+            /* A process faulting in a tight loop must not flood the log:
+             * report at most one exception per ~500ms. */
+            {
+                static uint64_t last_log_ticks;
+                uint64_t        now = sched_ticks();
+                if (now - last_log_ticks < 50) goto deliver;
+                last_log_ticks = now;
+                plogk("%s (pid=%llu): %s\n", name, proc->task->pid, msg);
+            }
+deliver:
             signal_send_thread(proc->task, sig, &info);
 
             syscall_frame_t sigframe = {0};

@@ -948,6 +948,8 @@ static int vfs_mount_id(const char *src, vfs_node_t node, int fsid)
 
     old_fsid   = node->fsid;
     node->fsid = fsid;
+    /* Remember the underlying filesystem's handle so umount can restore it. */
+    if (!node->mount_saved_handle) node->mount_saved_handle = node->handle;
 
     status = fs_callbacks[fsid]->mount(src, node);
     if (status == EOK) {
@@ -962,6 +964,10 @@ static int vfs_mount_id(const char *src, vfs_node_t node, int fsid)
 
     free(source_copy);
     node->fsid = old_fsid;
+    /* Restore the state a failed mount may have clobbered. */
+    node->handle = node->mount_saved_handle;
+    node->root   = node->parent ? node->parent->root : node;
+    node->is_mount = 0;
     return status;
 }
 
@@ -1002,33 +1008,65 @@ int vfs_mount_fs(const char *fstype, const char *src, vfs_node_t node)
     return -ENOENT;
 }
 
+/* Check whether any node below the mount point is still referenced by an
+ * open descriptor.  refcount > 0 means someone holds it, so the mounted
+ * filesystem must stay alive (mirroring Linux's EBUSY on umount). */
+static int vfs_umount_busy_recursive(vfs_node_t node)
+{
+    clist_t list = node->child;
+
+    while (list) {
+        vfs_node_t child = list->data;
+        if (child && (child->refcount > 0 || child->mapping)) return 1;
+        if (child && vfs_umount_busy_recursive(child)) return 1;
+        list = list->next;
+    }
+    return 0;
+}
+
 /* Unmount a file system from a directory */
 int vfs_umount(const char *path)
 {
     vfs_node_t node = vfs_open(path);
 
-    if (!node || !node->fsid) return -EINVAL;
-    if (node->type != file_dir) return -ENOTDIR;
-    if (node->parent) {
-        vfs_node_t cur = node;
-        node           = node->parent;
-        if (cur->root == cur) {
-            inotify_notify_unmount(cur);
-            vfs_free_child(cur);
-            callbackof(cur, unmount)(cur->handle);
-            free(cur->mount_source);
-            cur->mount_source = NULL;
-            cur->mount_id     = 0;
-            cur->fsid         = node->fsid;
-            cur->root         = node->root;
-            cur->handle       = 0;
-            cur->child        = 0;
-            cur->is_mount     = 0;
-            if (cur->fsid) do_update(cur);
-            return EOK;
-        }
+    if (!node) return -ENOENT;
+    if (!node->fsid) {
+        vfs_close(node);
+        return -EINVAL;
     }
-    return -ENOENT;
+    if (node->type != file_dir) {
+        vfs_close(node);
+        return -ENOTDIR;
+    }
+
+    int         result = -ENOENT;
+    vfs_node_t  parent = node->parent;
+    if (parent && node->root == node) {
+        if (vfs_umount_busy_recursive(node)) {
+            vfs_close(node);
+            return -EBUSY;
+        }
+
+        spin_lock(&vfs_namespace_lock);
+        inotify_notify_unmount(node);
+        vfs_free_child(node);
+        callbackof(node, unmount)(node->handle);
+        free(node->mount_source);
+        node->mount_source     = NULL;
+        node->mount_id         = 0;
+        node->fsid             = parent->fsid;
+        node->root             = parent->root;
+        node->handle           = node->mount_saved_handle;
+        node->mount_saved_handle = NULL;
+        node->child            = 0;
+        node->is_mount         = 0;
+        node->visited          = 0;
+        if (node->fsid) do_update(node);
+        spin_unlock(&vfs_namespace_lock);
+        result = EOK;
+    }
+    vfs_close(node);
+    return result;
 }
 
 typedef struct vfs_mount_format_scratch {

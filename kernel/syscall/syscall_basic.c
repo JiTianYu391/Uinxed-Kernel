@@ -12,6 +12,7 @@
 #include <fs/core/inotify.h>
 #include <fs/core/vfs.h>
 #include <kernel/errno.h>
+#include <kernel/kmsg.h>
 #include <kernel/printk.h>
 #include <kernel/timer.h>
 #include <libs/std/stddef.h>
@@ -1597,18 +1598,70 @@ int64_t sys_timer_delete_impl(uint64_t timerid, uint64_t arg1, uint64_t arg2, ui
  *  syslog
  * ====================================================================== */
 
+/* Linux syslog(2)/klogctl(2): exposes the kernel printk ring buffer to
+ * userspace (dmesg, syslogd).  Actions and semantics match Linux. */
 int64_t sys_syslog_impl(uint64_t type, uint64_t buf, uint64_t len, uint64_t arg3, uint64_t arg4, uint64_t arg5)
 {
-    (void)buf;
-    (void)len;
     (void)arg3;
     (void)arg4;
     (void)arg5;
-    /* 0=close, 1=open, 2=read, 3=read_all, 4=read_clear, 5=clear,
-     * 6=disable, 7=enable, 8=set_level, 9=unread, 10=size */
-    if (type == 10) return 0; /* kernel log buffer size: 0 */
-    if (type <= 9) return 0;  /* all operations accepted */
-    return -EINVAL;
+
+    switch (type) {
+        case SYSLOG_ACTION_CLOSE :
+        case SYSLOG_ACTION_OPEN :
+            return 0;
+
+        case SYSLOG_ACTION_READ :
+        case SYSLOG_ACTION_READ_ALL :
+        case SYSLOG_ACTION_READ_CLEAR : {
+            if (!buf || !len) return -EINVAL;
+            size_t need = type == SYSLOG_ACTION_READ ? kmsg_unread_bytes() : kmsg_total_bytes();
+            size_t take = need < len ? need : len;
+            if (!take) return 0;
+
+            char *scratch = malloc(take);
+            if (!scratch) return -ENOMEM;
+            size_t n = type == SYSLOG_ACTION_READ
+                           ? (size_t)kmsg_syslog_read(scratch, take)
+                           : kmsg_read_all(scratch, take, type == SYSLOG_ACTION_READ_CLEAR);
+            int    ret;
+            if (copy_to_user((void *)buf, scratch, n))
+                ret = -EFAULT;
+            else
+                ret = (int)n;
+            free(scratch);
+            return ret;
+        }
+
+        case SYSLOG_ACTION_CLEAR :
+            kmsg_clear();
+            return 0;
+
+        case SYSLOG_ACTION_CONSOLE_OFF :
+            console_loglevel = minimum_loglevel;
+            return 0;
+
+        case SYSLOG_ACTION_CONSOLE_ON :
+            console_loglevel = default_loglevel;
+            return 0;
+
+        case SYSLOG_ACTION_CONSOLE_LEVEL : {
+            if (!buf) return -EINVAL;
+            uint8_t level;
+            if (copy_from_user(&level, (const void *)buf, 1)) return -EFAULT;
+            console_loglevel = level > 7 ? 7 : level;
+            return 0;
+        }
+
+        case SYSLOG_ACTION_SIZE_UNREAD :
+            return (int64_t)kmsg_unread_bytes();
+
+        case SYSLOG_ACTION_SIZE_BUFFER :
+            return (int64_t)kmsg_buffer_size();
+
+        default :
+            return -EINVAL;
+    }
 }
 
 /* ======================================================================

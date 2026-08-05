@@ -80,6 +80,10 @@ enum procfs_pid_file_type {
     PROC_PID_CGROUP,
 };
 
+enum procfs_sys_file_type {
+    PROC_SYS_PRINTK,
+};
+
 enum procfs_type {
     PROCFS_ROOT,
     PROCFS_PID_DIR,
@@ -87,6 +91,8 @@ enum procfs_type {
     PROCFS_PID_FILE,
     PROCFS_NET_DIR,
     PROCFS_NET_FILE,
+    PROCFS_SYS_DIR, /* subtype 0 = /proc/sys, 1 = /proc/sys/kernel */
+    PROCFS_SYS_FILE,
     PROCFS_SELF_LINK,
 };
 
@@ -470,6 +476,20 @@ static void gen_info_version(procfs_file_t *pf)
     pf->content  = buf;
     pf->size     = n < 0 ? 0 : (size_t)n;
     pf->capacity = 256;
+}
+
+/* /proc/sys/kernel/printk: "console_loglevel default_loglevel
+ * minimum_loglevel boot_loglevel", exactly as on Linux. */
+static void gen_sys_printk(procfs_file_t *pf)
+{
+    char *buf = malloc(64);
+    if (!buf) return;
+
+    int n = snprintf(buf, 64, "%d %d %d %d\n", console_loglevel, default_loglevel, minimum_loglevel, boot_loglevel);
+
+    pf->content  = buf;
+    pf->size     = n < 0 ? 0 : (size_t)n;
+    pf->capacity = 64;
 }
 
 static void gen_info_loadavg(procfs_file_t *pf)
@@ -1013,6 +1033,13 @@ static void procfs_gen_content(procfs_file_t *pf, vfs_node_t node)
         case PROCFS_NET_FILE :
             gen_net_file(pf);
             break;
+        case PROCFS_SYS_FILE :
+            switch (pf->subtype) {
+                case PROC_SYS_PRINTK :
+                    gen_sys_printk(pf);
+                    break;
+            }
+            break;
         default :
             break;
     }
@@ -1089,6 +1116,12 @@ static void procfs_open(void *parent, const char *name, vfs_node_t node)
                     node->type = file_dir;
                     break;
                 }
+                if (streq(name, "sys")) {
+                    pf->type   = PROCFS_SYS_DIR;
+                    pf->subtype = 0;
+                    node->type = file_dir;
+                    break;
+                }
                 /* Try PID ?numeric directory name */
                 char *end;
                 pid_t pid = (pid_t)strtol(name, &end, 10);
@@ -1140,6 +1173,26 @@ static void procfs_open(void *parent, const char *name, vfs_node_t node)
             pf->subtype = subtype;
             break;
         }
+        case PROCFS_SYS_DIR : {
+            /* /proc/sys/kernel/{printk,...} */
+            if (ppf->subtype == 0) {
+                if (streq(name, "kernel")) {
+                    pf->type    = PROCFS_SYS_DIR;
+                    pf->subtype = 1;
+                    node->type  = file_dir;
+                    break;
+                }
+                free(pf);
+                return;
+            }
+            if (streq(name, "printk")) {
+                pf->type    = PROCFS_SYS_FILE;
+                pf->subtype = PROC_SYS_PRINTK;
+                break;
+            }
+            free(pf);
+            return;
+        }
         default :
             free(pf);
             return;
@@ -1173,7 +1226,8 @@ static int procfs_file_open(vfs_node_t node, uint64_t flags, void **private_data
     (void)flags;
     if (!node || !private_data) return -EINVAL;
     procfs_file_t *source = node->handle;
-    if (!source || (source->type != PROCFS_INFO_FILE && source->type != PROCFS_PID_FILE && source->type != PROCFS_NET_FILE)) {
+    if (!source || (source->type != PROCFS_INFO_FILE && source->type != PROCFS_PID_FILE && source->type != PROCFS_NET_FILE
+                    && source->type != PROCFS_SYS_FILE)) {
         *private_data = NULL;
         return EOK;
     }
@@ -1239,6 +1293,7 @@ static int procfs_stat(void *file, vfs_node_t node)
             }
 
             (void)procfs_ensure_child(node, "net", PROCFS_NET_DIR, 0, 0, file_dir);
+            (void)procfs_ensure_child(node, "sys", PROCFS_SYS_DIR, 0, 0, file_dir);
             (void)procfs_ensure_child(node, "self", PROCFS_SELF_LINK, 0, 0, file_symlink);
             (void)procfs_ensure_child(node, "thread-self", PROCFS_SELF_LINK, 0, 1, file_symlink);
 
@@ -1288,12 +1343,22 @@ static int procfs_stat(void *file, vfs_node_t node)
             for (int i = 0; i < 6; i++) { (void)procfs_ensure_child(node, names[i], PROCFS_NET_FILE, 0, i, file_none); }
             break;
         }
+        case PROCFS_SYS_DIR : {
+            node->type = file_dir;
+            if (pf->subtype == 0) {
+                (void)procfs_ensure_child(node, "kernel", PROCFS_SYS_DIR, 0, 1, file_dir);
+            } else {
+                (void)procfs_ensure_child(node, "printk", PROCFS_SYS_FILE, 0, PROC_SYS_PRINTK, file_none);
+            }
+            break;
+        }
         case PROCFS_SELF_LINK :
             node->type = file_symlink;
             break;
         case PROCFS_INFO_FILE :
         case PROCFS_PID_FILE :
         case PROCFS_NET_FILE :
+        case PROCFS_SYS_FILE :
             /* procfs files are generated pseudo-regular files.  They are
              * seekable and, most importantly, reads must advance the open
              * file description offset so that readers can observe EOF.
@@ -1326,9 +1391,41 @@ static size_t procfs_read(void *file, void *addr, size_t offset, size_t size)
 
 static size_t procfs_write(void *file, const void *addr, size_t offset, size_t size)
 {
-    (void)file;
-    (void)addr;
     (void)offset;
+    procfs_file_t *pf = file;
+    if (!pf || !addr || !size) return size ? size : 0;
+
+    if (pf->type == PROCFS_SYS_FILE && pf->subtype == PROC_SYS_PRINTK) {
+        /* Linux accepts up to four whitespace-separated integers:
+         * console_loglevel default_loglevel minimum_loglevel boot_loglevel.
+         * Values are clamped like syslog(2)'s CONSOLE_LEVEL action. */
+        char buf[64];
+        size_t n = size < sizeof(buf) ? size : sizeof(buf) - 1;
+        memcpy(buf, addr, n);
+        buf[n] = '\0';
+
+        char *p   = buf;
+        int   val = (int)strtol(p, &p, 10);
+        console_loglevel = val > 7 ? 7 : (val < 0 ? 0 : val);
+        if (p == buf) return size;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) {
+            val              = (int)strtol(p, &p, 10);
+            default_loglevel = val > 7 ? 7 : (val < 0 ? 0 : val);
+        }
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) {
+            val               = (int)strtol(p, &p, 10);
+            minimum_loglevel  = val > 7 ? 7 : (val < 0 ? 0 : val);
+        }
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) {
+            val           = (int)strtol(p, &p, 10);
+            boot_loglevel = val > 7 ? 7 : (val < 0 ? 0 : val);
+        }
+        return size;
+    }
+
     return size;
 }
 

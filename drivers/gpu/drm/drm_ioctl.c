@@ -324,7 +324,14 @@ int drm_ioctl(struct drm_device *dev, unsigned int cmd, void *user_data, struct 
         if (cmd == DRM_IOCTL_MODE_CREATE_DUMB) {
             ret = drm_ioctl_permit(DRM_AUTH, file_priv);
             if (ret) goto out;
-            ret = drm_gem_dumb_create(file_priv, dev, (struct drm_mode_create_dumb *)kdata);
+            /* Route through the driver callback: virtio-gpu allocates a
+             * host resource, plain GEM objects have resource_id 0 and
+             * transfers to the host are rejected. */
+            if (!dev->driver->dumb_create) {
+                ret = -EOPNOTSUPP;
+                goto out;
+            }
+            ret = dev->driver->dumb_create(file_priv, dev, (struct drm_mode_create_dumb *)kdata);
             goto copy_out;
         }
         if (cmd == DRM_IOCTL_MODE_MAP_DUMB) {

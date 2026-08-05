@@ -9,6 +9,8 @@
  */
 
 #include <drivers/char/tty.h>
+#include <drivers/ports/serial.h>
+#include <kernel/kmsg.h>
 #include <kernel/printk.h>
 #include <libs/std/stdarg.h>
 #include <libs/std/stddef.h>
@@ -23,6 +25,15 @@
 
 #define BUF_SIZE 2048 // least 2 bytes (1 byte is for '\0')
 
+/* Console log levels, mirroring Linux: only records with a level <=
+ * console_loglevel are printed to the console, while the kmsg ring keeps
+ * everything.  Controlled via /proc/sys/kernel/printk, syslog(2) and the
+ * loglevel= boot parameter. */
+int console_loglevel = 6;
+int default_loglevel = 4;
+int minimum_loglevel = 1;
+int boot_loglevel    = 7;
+
 /* Lock for printk */
 spinlock_t printk_lock = {
     .lock   = 0,
@@ -35,26 +46,74 @@ spinlock_t plogk_lock = {
     .rflags = 0,
 };
 
-/* Kernel print string */
-void printk(const char *format, ...)
+/* Mirrored writer: forwards every character to the active console and, once
+ * the serial ports are up, to COM1 so headless debugging always works.
+ * When the boot console *is* a serial port, that port already receives the
+ * output through the line-buffered tty path, so no mirror is needed. */
+static uint8_t klog_writer_handler(writer *writer, char c)
 {
+    (void)writer;
+    tty_writer_handler(&tty_writer, c);
+    tty_device_t *boot = get_boot_tty();
+    if (!boot || boot->type == TTY_DEVICE_VGA || boot->type == TTY_DEVICE_DRM) write_serial(SERIAL_PORT_1, (uint8_t)c);
+    return 1;
+}
+
+static writer klog_writer = {
+    .data    = 0,
+    .handler = klog_writer_handler,
+};
+
+/* Emit a fully formatted record (text must end with '\n'): store it in the
+ * kmsg ring unconditionally, then print to the console when the level
+ * passes the console_loglevel filter.  Used by printk() and /dev/kmsg. */
+void printk_emit(int level, const char *text, size_t len)
+{
+    if (!text || !len) return;
+    if (level < 0) level = default_loglevel;
+
+    kmsg_record(level, text, len);
+
+    if (level > console_loglevel) return;
     spin_lock(&printk_lock); // Lock
-    va_list args;
-    va_start(args, format);
-    vwprintf(&tty_writer, format, args);
-    va_end(args);
+    for (size_t i = 0; i < len; i++) klog_writer_handler(&klog_writer, text[i]);
     spin_unlock(&printk_lock); // Unlock
 }
 
-/* Kernel print log */
+/* Kernel print string */
+void printk(const char *format, ...)
+{
+    if (!format) return;
+
+    /* Parse an optional \001<digit> log-level prefix. */
+    int level = default_loglevel;
+    if (format[0] == '\001' && format[1] >= '0' && format[1] <= '7') {
+        level  = format[1] - '0';
+        format += 2;
+    }
+
+    char buf[BUF_SIZE];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+    if (len < 0) len = 0;
+    if ((size_t)len >= sizeof(buf)) len = (int)sizeof(buf) - 1;
+    if (len && buf[len - 1] != '\n' && (size_t)len < sizeof(buf) - 1) buf[len++] = '\n';
+
+    printk_emit(level, buf, (size_t)len);
+}
+
+/* Kernel print log (timestamped, KERN_INFO level) */
 void plogk(const char *format, ...)
 {
 #if KERNEL_LOG
+    if (!format || 6 > console_loglevel) return;
     spin_lock(&plogk_lock); // Lock
     printk("[%5d.%06d] ", nano_time() / 1000000000, (nano_time() / 1000) % 1000000);
     va_list args;
     va_start(args, format);
-    vwprintf(&tty_writer, format, args);
+    vwprintf(&klog_writer, format, args);
     va_end(args);
     spin_unlock(&plogk_lock); // Unlock
 #else

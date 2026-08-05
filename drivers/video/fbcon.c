@@ -52,10 +52,17 @@ static bool     cursor_drawn;
 static uint32_t cursor_drawn_row;
 static uint32_t cursor_drawn_col;
 
+/* Logo overlay offsets.  While the boot logo is on screen they reserve the
+ * top strip for it; video_remove_boot_logo() drops them to zero so the
+ * console takes the whole framebuffer. */
 #if BOOT_LOGO
-static uint32_t fbcon_offset_x      = 0;
-static uint32_t fbcon_offset_y      = 98;
-static uint32_t fbcon_draw_offset_y = 12;
+uint32_t fbcon_offset_x      = 0;
+uint32_t fbcon_offset_y      = 98;
+uint32_t fbcon_draw_offset_y = 12;
+#else
+uint32_t fbcon_offset_x      = 0;
+uint32_t fbcon_offset_y      = 0;
+uint32_t fbcon_draw_offset_y = 0;
 #endif
 
 static void fbcon_mark_cell_dirty(uint32_t row, uint32_t col)
@@ -102,15 +109,9 @@ static void fbcon_flush_dirty_rows(void)
     for (uint32_t row = 0; row < c_height; row++) {
         if (dirty_first_col[row] > dirty_last_col[row]) continue;
 
-#if BOOT_LOGO
         uint32_t x1 = dirty_first_col[row] * font_width + fbcon_offset_x;
         uint32_t y1 = row * font_height + fbcon_offset_y + fbcon_draw_offset_y;
         uint32_t x2 = (dirty_last_col[row] + 1) * font_width + fbcon_offset_x;
-#else
-        uint32_t x1 = dirty_first_col[row] * font_width;
-        uint32_t y1 = row * font_height;
-        uint32_t x2 = (dirty_last_col[row] + 1) * font_width;
-#endif
         uint32_t y2 = y1 + font_height;
 
         if (x1 < damage_x1) damage_x1 = x1;
@@ -143,11 +144,7 @@ static void fbcon_redraw_screen(void)
 static void fbcon_clear_uncovered_bottom(void)
 {
     if (!buffer) return;
-#if BOOT_LOGO
     uint32_t used_height = fbcon_offset_y + fbcon_draw_offset_y + c_height * font_height;
-#else
-    uint32_t used_height = c_height * font_height;
-#endif
     if (used_height < height) {
         for (uint32_t y = used_height; y < height; y++) {
             uint32_t *line  = buffer + (size_t)y * stride;
@@ -400,13 +397,8 @@ void fbcon_init(void)
 
     cx = cy = 0;
 
-#if BOOT_LOGO
     c_width  = width > fbcon_offset_x ? (width - fbcon_offset_x) / font_width : 80;
     c_height = height > fbcon_offset_y ? (height - fbcon_offset_y) / font_height : 25;
-#else
-    c_width  = width / font_width;
-    c_height = height / font_height;
-#endif
 
     fore_color = color_to_fb_color((color_t) {0xaa, 0xaa, 0xaa});
     back_color = color_to_fb_color((color_t) {0x00, 0x00, 0x00});
@@ -460,13 +452,8 @@ void fbcon_resize(void)
     free(dirty_first_col);
     free(dirty_last_col);
 
-#if BOOT_LOGO
-    c_width  = (width - fbcon_offset_x) / font_width;
-    c_height = (height - fbcon_offset_y) / font_height;
-#else
-    c_width  = width / font_width;
-    c_height = height / font_height;
-#endif
+    c_width  = width > fbcon_offset_x ? (width - fbcon_offset_x) / font_width : 80;
+    c_height = height > fbcon_offset_y ? (height - fbcon_offset_y) / font_height : 25;
 
     text_grid       = calloc((size_t)c_width * c_height, sizeof(char));
     color_grid      = malloc((size_t)c_width * c_height * sizeof(uint32_t));
@@ -514,11 +501,7 @@ void fbcon_draw_char_bg(const char c, uint32_t x, uint32_t y, uint32_t fg, uint3
 {
     if (!buffer) return;
     uint8_t *char_font = ascii_font + (size_t)(uint8_t)c * font_height;
-#if BOOT_LOGO
     uint32_t char_base_addr = (y + fbcon_offset_y + fbcon_draw_offset_y) * stride + (x + fbcon_offset_x);
-#else
-    uint32_t char_base_addr = y * stride + x;
-#endif
 
     for (uint32_t row = 0; row < font_height; row++) {
         uint32_t *row_buf  = buffer + char_base_addr + row * stride;
@@ -621,6 +604,18 @@ void fbcon_ansi_write(const uint8_t *buf, size_t len)
     for (size_t i = 0; i < len; i++) { vt_ansi_process(&vt_ansi_state, buf[i], &vt_ansi_cb, NULL); }
     redraw_deferred--;
     fbcon_flush_screen_updates();
+    spin_unlock(&fbcon_lock);
+}
+
+/* Enable/disable the logo overlay reserve.  When the boot logo is removed
+ * the console grid is rebuilt to cover the whole framebuffer. */
+void fbcon_set_logo_reserve(bool reserve)
+{
+    spin_lock(&fbcon_lock);
+    fbcon_offset_x      = 0;
+    fbcon_offset_y      = reserve ? 98 : 0;
+    fbcon_draw_offset_y = reserve ? 12 : 0;
+    fbcon_resize();
     spin_unlock(&fbcon_lock);
 }
 

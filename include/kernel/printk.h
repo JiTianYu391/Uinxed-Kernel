@@ -20,6 +20,48 @@
 #    define KERNEL_LOG 1
 #endif
 
+/* Log levels, Linux-style \001<digit> prefixes parsed by printk().
+ * Messages with a level above console_loglevel are dropped. */
+#define KERN_EMERG   "\001" "0"
+#define KERN_ALERT   "\001" "1"
+#define KERN_CRIT    "\001" "2"
+#define KERN_ERR     "\001" "3"
+#define KERN_WARNING "\001" "4"
+#define KERN_NOTICE  "\001" "5"
+#define KERN_INFO    "\001" "6"
+#define KERN_DEBUG   "\001" "7"
+
+/* Console log levels, mirroring Linux: records with a level above
+ * console_loglevel are kept in the kmsg ring but not printed to the
+ * console.  Managed via /proc/sys/kernel/printk and the loglevel= boot
+ * argument. */
+extern int console_loglevel;
+extern int default_loglevel;
+extern int minimum_loglevel;
+extern int boot_loglevel;
+
+/* Emit a fully formatted record (must end with '\n'): ring + console. */
+void printk_emit(int level, const char *text, size_t len);
+
+#define pr_emerg(...)   printk(KERN_EMERG __VA_ARGS__)
+#define pr_alert(...)   printk(KERN_ALERT __VA_ARGS__)
+#define pr_crit(...)    printk(KERN_CRIT __VA_ARGS__)
+#define pr_err(...)     printk(KERN_ERR __VA_ARGS__)
+#define pr_warn(...)    printk(KERN_WARNING __VA_ARGS__)
+#define pr_notice(...)  printk(KERN_NOTICE __VA_ARGS__)
+#define pr_info(...)    printk(KERN_INFO __VA_ARGS__)
+#define pr_debug(...)   printk(KERN_DEBUG __VA_ARGS__)
+
+/* Emit a message at most once per site. */
+#define printk_once(fmt, ...)                   \
+    do {                                        \
+        static bool _printed_once_ = false;     \
+        if (!_printed_once_) {                  \
+            _printed_once_ = true;              \
+            printk(fmt, ##__VA_ARGS__);         \
+        }                                       \
+    } while (0)
+
 typedef enum {
     OFLOW_AT_FMTARG,
     OFLOW_AT_FMTSTR,

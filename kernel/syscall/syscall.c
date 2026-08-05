@@ -3171,6 +3171,26 @@ static void pidfd_ensure_init(void)
     pidfd_fsid   = vfs_regist(cb);
 }
 
+/* Install a pidfd for an already-retained process; returns fd or negative error. */
+static int pidfd_install(process_t *proc, process_t *target)
+{
+    pidfd_ensure_init();
+    if (pidfd_fsid < 0) return -ENOMEM;
+
+    vfs_node_t node = vfs_node_alloc(NULL, "[pidfd]");
+    if (!node) return -ENOMEM;
+
+    node->type   = file_stream;
+    node->handle = target; /* caller must process_put in close */
+    node->fsid   = pidfd_fsid;
+    node->size   = 0;
+    node->mode   = O_RDONLY;
+
+    int fd = process_fd_install(proc, node, O_RDONLY);
+    if (fd < 0) vfs_close(node);
+    return fd;
+}
+
 static int64_t sys_pidfd_open_impl(uint64_t pid_raw, uint64_t flags, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5)
 {
     (void)arg2;
@@ -3189,30 +3209,12 @@ static int64_t sys_pidfd_open_impl(uint64_t pid_raw, uint64_t flags, uint64_t ar
         return -ESRCH;
     }
 
-    pidfd_ensure_init();
-    if (pidfd_fsid < 0) {
-        process_put(target);
-        return -ENOMEM;
-    }
-
-    vfs_node_t node = vfs_node_alloc(NULL, "[pidfd]");
-    if (!node) {
-        process_put(target);
-        return -ENOMEM;
-    }
-
-    node->type   = file_stream;
-    node->handle = target; /* caller must process_put in close */
-    node->fsid   = pidfd_fsid;
-    node->size   = 0;
-    node->mode   = O_RDONLY;
-
     uint64_t fd_flags = O_RDONLY;
     if (flags & PIDFD_NONBLOCK) fd_flags |= O_NONBLOCK;
 
-    int fd = process_fd_install(proc, node, fd_flags);
+    int fd = pidfd_install(proc, target);
     if (fd < 0) {
-        vfs_close(node);
+        process_put(target);
         return fd;
     }
     return fd;
@@ -3234,17 +3236,12 @@ struct clone3_args {
         uint64_t cgroup;
 };
 
-static int64_t sys_clone3_impl(uint64_t cl_args, uint64_t size, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5)
+static int64_t sys_clone3_impl(syscall_frame_t *frame, uint64_t cl_args, uint64_t size)
 {
-    (void)arg2;
-    (void)arg3;
-    (void)arg4;
-    (void)arg5;
+    struct clone3_args args;
 
     if (size < sizeof(struct clone3_args)) return -EINVAL;
     if (size > sizeof(struct clone3_args)) return -E2BIG;
-
-    struct clone3_args args;
     if (copy_from_user(&args, (const void *)cl_args, sizeof(args))) return -EFAULT;
 
     /* Validate flags */
@@ -3257,56 +3254,76 @@ static int64_t sys_clone3_impl(uint64_t cl_args, uint64_t size, uint64_t arg2, u
         flags = (flags & ~0xffULL) | (exit_signal & 0xff);
     }
 
-    /* For now, support the same subset as our existing clone:
-     * CLONE_VM|CLONE_VFORK for vfork, CLONE_THREAD|CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_SYSVSEM for threads,
-     * and basic fork (flags=signal only). */
-    uint64_t supported_thread = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+    process_t *proc = process_current();
+    if (!proc) return -ESRCH;
 
-    bool is_thread = (flags & CLONE_THREAD) != 0;
-    bool is_vfork  = (flags & CLONE_VFORK) != 0;
-
-    if (is_thread) {
-        if ((flags & supported_thread) != flags) return -EINVAL;
-        /* Thread creation handled by the dispatch's CLONE_THREAD path */
-        /* But we're not in the dispatch here; we need to simulate it. */
-    }
-
-    /* For a basic fork or vfork, delegate to the existing wrapper.
-     * Since we can't easily redirect to the dispatch's fork/clone logic
-     * from here, we use the process-level API directly. */
-
-    /* Simplify: treat clone3 as clone with flags */
-    if (is_thread) {
-        process_t *proc = process_current();
-        if (!proc) return -ESRCH;
+    /* Thread creation: requires the full pthread flag set, mirrors the
+     * SYS_CLONE CLONE_THREAD path so the child gets a proper kernel stack
+     * and syscall-return trampoline instead of resuming the parent's
+     * scheduler context. */
+    if (flags & CLONE_THREAD) {
+        if ((flags & CLONE_PTHREAD_REQUIRED) != CLONE_PTHREAD_REQUIRED || (flags & ~CLONE_PTHREAD_ALLOWED)) return -EINVAL;
+        if (((flags & CLONE_PARENT_SETTID) && !args.parent_tid)
+            || ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) && !args.child_tid))
+            return -EFAULT;
 
         int     error = EOK;
-        task_t *child = process_clone_thread(NULL, args.stack, args.parent_tid, args.child_tid, args.child_tid, args.tls, &error);
+        task_t *child = process_clone_thread(frame, args.stack ? args.stack : frame->rsp,
+                                             (flags & CLONE_PARENT_SETTID) ? args.parent_tid : 0,
+                                             (flags & CLONE_CHILD_SETTID) ? args.child_tid : 0,
+                                             (flags & CLONE_CHILD_CLEARTID) ? args.child_tid : 0,
+                                             (flags & CLONE_SETTLS) ? args.tls : current_task()->thread.fs_base, &error);
         if (!child) return error;
+        if (args.pidfd) {
+            int pidfd = pidfd_install(proc, child->process);
+            if (pidfd >= 0 && copy_to_user((void *)args.pidfd, &pidfd, sizeof(int))) {
+                sys_close(pidfd, 0, 0, 0, 0, 0);
+                pidfd = -EFAULT;
+            }
+            if (pidfd < 0) {
+                (void)process_kill(child->pid);
+                return pidfd;
+            }
+        }
         return (int64_t)child->pid;
     }
 
     /* Fork / vfork */
-    int        error = EOK;
-    process_t *child = process_fork_status_event_mode(&error, is_vfork ? PTRACE_EVENT_VFORK : PTRACE_EVENT_FORK, is_vfork);
-    if (!child) return error;
+    bool vfork = (flags & CLONE_VFORK) != 0;
+    uint64_t supported = vfork ? (CLONE_VM | CLONE_VFORK | SIGCHLD) : SIGCHLD;
+    if ((flags & ~supported) || (vfork && !(flags & CLONE_VM)) || ((flags & 0xff) != SIGCHLD)) return -EINVAL;
 
-    if (args.stack && args.stack_size) {
-        /* Set up child stack */
-        task_t *ct = child->task;
-        if (ct) {
-            uint64_t  kstack_top = (uint64_t)(child->kernel_stack + PROCESS_KERNEL_STACK);
-            uint64_t *kstack     = (uint64_t *)ALIGN_DOWN(kstack_top, 16ULL);
-            kstack -= 4; /* Leave room */
-            *(--kstack)     = (uint64_t)syscall_return;
-            ct->context.rsp = (uint64_t)kstack;
-            /* Set the user stack pointer via the child's context */
-            /* This needs to be done in process_fork_publish context... */
+    int        error = EOK;
+    uint32_t   event = vfork ? PTRACE_EVENT_VFORK : PTRACE_EVENT_FORK;
+    process_t *child = process_fork_status_event_mode(&error, event, vfork);
+    if (child) {
+        uint64_t        kstack_top  = (uint64_t)(child->kernel_stack + PROCESS_KERNEL_STACK);
+        uint64_t       *kstack      = (uint64_t *)ALIGN_DOWN(kstack_top, 16ULL);
+        syscall_frame_t child_frame = *frame;
+        child_frame.rax             = 0;
+        if (vfork) child_frame.rsp = args.stack ? args.stack : child_frame.rsp;
+        kstack -= sizeof(syscall_frame_t) / sizeof(uint64_t);
+        memcpy(kstack, &child_frame, sizeof(syscall_frame_t));
+        *(--kstack)              = (uint64_t)syscall_return;
+        child->task->context.rsp = (uint64_t)kstack;
+        process_fork_publish(child);
+    }
+    if (!child) return error;
+    if (args.pidfd) {
+        int pidfd = pidfd_install(proc, child);
+        if (pidfd >= 0 && copy_to_user((void *)args.pidfd, &pidfd, sizeof(int))) {
+            sys_close(pidfd, 0, 0, 0, 0, 0);
+            pidfd = -EFAULT;
+        }
+        if (pidfd < 0) {
+            (void)process_kill(child->task->pid);
+            return pidfd;
         }
     }
-
-    process_fork_publish(child);
-    if (is_vfork) process_vfork_wait(child);
+    if (vfork) {
+        process_vfork_wait(child);
+        ptrace_fork_event(frame, PTRACE_EVENT_VFORK_DONE, child->task->pid);
+    }
     return (int64_t)child->task->pid;
 }
 
@@ -4057,8 +4074,9 @@ static char **copy_argv_from_user(const char *const *uargv, int *out_count)
     int   count = 0;
     char *ubuf;
     for (int i = 0;; i++) {
-        if (copy_from_user(&ubuf, (void *)&uargv[i], sizeof(char *))) break;
+        if (copy_from_user(&ubuf, (void *)&uargv[i], sizeof(char *))) return NULL;
         if (!ubuf) break;
+        if (count >= PROCESS_MAX_ARGV) return NULL;
         count++;
     }
     if (count == 0) return NULL;
@@ -4067,7 +4085,7 @@ static char **copy_argv_from_user(const char *const *uargv, int *out_count)
     char **kargv = malloc((count + 1) * sizeof(char *));
     if (!kargv) return NULL;
 
-    /* Second pass: copy each string */
+    /* Second pass: copy each string (cap individual length) */
     int i;
     for (i = 0; i < count; i++) {
         char *ustr;
@@ -4084,7 +4102,12 @@ static char **copy_argv_from_user(const char *const *uargv, int *out_count)
                 goto fail;
             }
             len++;
-        } while (tmp != '\0');
+        } while (tmp != '\0' && len <= 4096);
+
+        if (tmp != '\0') {
+            kargv[i] = NULL;
+            goto fail;
+        }
 
         kargv[i] = malloc(len);
         if (!kargv[i]) goto fail;
@@ -4128,6 +4151,13 @@ static int64_t do_execve(const char *path, char *const argv[], char *const envp[
     char **kargv = copy_argv_from_user((const char *const *)argv, &argc);
     char **kenvp = copy_argv_from_user((const char *const *)envp, &envc);
     (void)envc;
+
+    /* argv is required (Linux returns EFAULT for a NULL/unreadable argv);
+     * envp may legitimately be NULL. */
+    if (!kargv) {
+        free_string_array(kenvp);
+        return -EFAULT;
+    }
 
     uint8_t *elf_data = NULL;
     size_t   total    = 0;
@@ -5209,7 +5239,7 @@ static syscall_fn_t syscall_table[SYS_MAX] = {
     [SYS_FSMOUNT]                = sys_stub,
     [SYS_FSPICK]                 = sys_stub,
     [SYS_PIDFD_OPEN]             = sys_pidfd_open_impl,
-    [SYS_CLONE3]                 = sys_clone3_impl,
+    [SYS_CLONE3]                 = 0, /* handled specially in syscall_dispatch */
     [SYS_CLOSE_RANGE]            = sys_close_range,
     [SYS_OPENAT2]                = sys_openat2_impl,
     [SYS_PIDFD_GETFD]            = sys_pidfd_getfd_impl,
@@ -5237,6 +5267,12 @@ void syscall_dispatch(syscall_frame_t *frame)
 
     ptrace_syscall_enter(frame, num);
     num = frame->rax;
+
+    if (num == SYS_CLONE3) {
+        int64_t ret = sys_clone3_impl(frame, frame->rdi, frame->rsi);
+        frame->rax  = (uint64_t)ret;
+        goto check_signals;
+    }
 
     if (num == SYS_CLONE && (frame->rdi & CLONE_THREAD)) {
         uint64_t flags = frame->rdi;
@@ -5294,7 +5330,14 @@ void syscall_dispatch(syscall_frame_t *frame)
 
     if (num >= SYS_MAX || !syscall_table[num]) {
         task_t *task = current_task();
-        plogk("syscall: unimplemented syscall %llu from pid %llu (%s)\n", num, task ? task->pid : 0, task ? task->name : "?");
+        /* Log each unimplemented syscall number at most once; probing
+         * programs otherwise flood the log with thousands of lines. */
+        static uint64_t reported[SYS_MAX / 64 + 1];
+        uint64_t        word = num / 64, bit = 1ULL << (num % 64);
+        if (word < sizeof(reported) / sizeof(reported[0]) && !(reported[word] & bit)) {
+            reported[word] |= bit;
+            plogk("syscall: unimplemented syscall %llu from pid %llu (%s)\n", num, task ? task->pid : 0, task ? task->name : "?");
+        }
         retval     = -ENOSYS;
         frame->rax = (uint64_t)retval;
         goto check_signals;

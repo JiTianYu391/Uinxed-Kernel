@@ -324,7 +324,12 @@ static void video_refresh_worker(void *arg)
         uint64_t         generation = video_generation;
         video_flush_fn_t flush      = video_flush_cb;
         spin_unlock(&video_state_lock);
-        if (!front || !active_w || !active_h || !flush || active_h > SIZE_MAX / active_row) continue;
+        if (!front || !active_w || !active_h || active_h > SIZE_MAX / active_row) continue;
+
+        /* Without a flush callback the framebuffer is mapped directly to
+         * the display (GOP/legacy VGA): writes are already visible, so
+         * only the cursor blink above needs the periodic wakeup. */
+        if (!flush) continue;
 
         size_t active_size = (size_t)active_row * active_h;
         if (!snapshot || snapshot_size != active_size || snapshot_generation != generation) {
@@ -359,7 +364,9 @@ static void video_refresh_worker(void *arg)
 void video_start_refresh_worker(void)
 {
     spin_lock(&video_state_lock);
-    bool should_start = video_flush_cb && !video_refresh_worker_started;
+    /* Start whenever a framebuffer exists: on the plain GOP/VGA path there
+     * is no flush callback, but the worker still drives the cursor blink. */
+    bool should_start = buffer && !video_refresh_worker_started;
     if (should_start) video_refresh_worker_started = true;
     spin_unlock(&video_state_lock);
     if (should_start && !kthread_create("virtgpu-refresh", video_refresh_worker, NULL)) {
