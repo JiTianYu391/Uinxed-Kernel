@@ -1235,7 +1235,6 @@ process_t *process_create(const char *name, void (*entry)(void *), void *arg)
 
     if (proc->parent && proc->parent != proc) { slist_insert_tail(&proc->parent->children, proc); }
 
-    plogk("process: Created user process skeleton %llu (%s)\n", proc->task->pid, proc->task->name);
     return proc;
 }
 
@@ -1306,7 +1305,6 @@ process_t *process_create_kernel(const char *name, void (*entry)(void *), void *
 
     if (proc->parent && proc->parent != proc) { slist_insert_tail(&proc->parent->children, proc); }
 
-    plogk("process: Created kernel thread %llu (%s)\n", proc->task->pid, proc->task->name);
     return proc;
 }
 
