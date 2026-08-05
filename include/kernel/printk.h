@@ -12,6 +12,7 @@
 #define INCLUDE_PRINTK_H_
 
 #include <libs/std/stdarg.h>
+#include <libs/std/stdbool.h>
 #include <libs/std/stddef.h>
 #include <libs/std/stdint.h>
 #include <libs/std/stdlib.h>
@@ -31,14 +32,22 @@
 #define KERN_INFO    "\001" "6"
 #define KERN_DEBUG   "\001" "7"
 
-/* Console log levels, mirroring Linux: records with a level above
+/* Console log levels, mirroring Linux: records with a level at or above
  * console_loglevel are kept in the kmsg ring but not printed to the
- * console.  Managed via /proc/sys/kernel/printk and the loglevel= boot
- * argument. */
+ * console (suppress_message_printing semantics: "level >= console_loglevel
+ * && !ignore_loglevel").  Managed via /proc/sys/kernel/printk, syslog(2)
+ * and the loglevel=/quiet/debug/ignore_loglevel boot arguments. */
 extern int console_loglevel;
 extern int default_loglevel;
 extern int minimum_loglevel;
 extern int boot_loglevel;
+
+/* ignore_loglevel boot argument: print every record to the console. */
+extern bool ignore_loglevel;
+
+/* printk.time= boot argument (default on): prefix console records with a
+ * "[seconds.microseconds] " timestamp, as Linux does with PRINTK_TIME. */
+extern bool printk_time;
 
 /* Emit a fully formatted record (must end with '\n'): ring + console. */
 void printk_emit(int level, const char *text, size_t len);

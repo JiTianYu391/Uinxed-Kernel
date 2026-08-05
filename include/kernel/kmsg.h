@@ -16,8 +16,19 @@
 #include <libs/std/stdint.h>
 
 /* Ring buffer capacity in bytes (Linux default log_buf is 1/4 of RAM, capped;
- * a fixed 256 KiB keeps the boot-time footprint predictable). */
+ * a fixed 256 KiB keeps the boot-time footprint predictable; log_buf_len=
+ * overrides it). */
 #define KMSG_BUFFER_SIZE (256 * 1024)
+
+/* printk.devkmsg= boot argument, mirroring Linux: "on" accepts every write,
+ * "off" rejects them (-EPERM), "ratelimit" (default) accepts them. */
+enum kmsg_devkmsg_mode {
+    KMSG_DEVKMSG_RATELIMIT,
+    KMSG_DEVKMSG_ON,
+    KMSG_DEVKMSG_OFF,
+};
+
+extern enum kmsg_devkmsg_mode kmsg_devkmsg;
 
 /* syslog(2) / klogctl(2) action numbers, identical to Linux. */
 #define SYSLOG_ACTION_CLOSE        0

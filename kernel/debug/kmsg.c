@@ -27,6 +27,7 @@
 #include <libs/std/stdbool.h>
 #include <libs/std/stddef.h>
 #include <libs/std/stdint.h>
+#include <libs/std/stdlib.h>
 #include <libs/std/string.h>
 #include <mem/heap.h>
 #include <sync/spin_lock.h>
@@ -47,11 +48,15 @@ typedef struct {
 
 static spinlock_t kmsg_lock;
 static uint8_t   *kmsg_buf;
+static size_t     kmsg_buf_size = KMSG_BUFFER_SIZE; /* log_buf_len= boot arg */
 static size_t     kmsg_head;       /* next write offset; == tail when empty */
 static size_t     kmsg_tail;       /* oldest record offset */
 static uint64_t   kmsg_seq;        /* seq of the next record */
 static uint64_t   kmsg_syslog_seq; /* syslog(2) read cursor */
 static bool       kmsg_ready;
+
+/* printk.devkmsg= boot argument (Linux default: ratelimit). */
+enum kmsg_devkmsg_mode kmsg_devkmsg = KMSG_DEVKMSG_RATELIMIT;
 
 /* Round n up to an 8-byte boundary. */
 static size_t kmsg_align(size_t n)
@@ -75,6 +80,7 @@ static bool kmsg_drop_oldest_locked(void)
         size_t used = kmsg_head - kmsg_tail;
         if (used < KMSG_HDR_SIZE) { kmsg_tail = kmsg_head; break; }
         kmsg_record_hdr_t *hdr = (kmsg_record_hdr_t *)(kmsg_buf + kmsg_tail);
+        if (hdr->len > kmsg_buf_size - KMSG_HDR_SIZE) return false;
         size_t next = kmsg_align(kmsg_tail + KMSG_HDR_SIZE + hdr->len);
         if (next > kmsg_head) return false;
         kmsg_tail = next;
@@ -93,18 +99,19 @@ void kmsg_record(int level, const char *text, size_t len)
     if (!len) return;
 
     size_t total = KMSG_HDR_SIZE + len;
-    if (total > KMSG_BUFFER_SIZE) {
-        len   = KMSG_BUFFER_SIZE - KMSG_HDR_SIZE;
-        total = KMSG_BUFFER_SIZE;
+    if (len > 0xFFFF) len = 0xFFFF; /* hdr->len is uint16_t */
+    if (total > kmsg_buf_size) {
+        len   = kmsg_buf_size - KMSG_HDR_SIZE;
+        total = kmsg_buf_size;
     }
 
     spin_lock(&kmsg_lock);
     for (;;) {
-        size_t free = KMSG_BUFFER_SIZE - kmsg_head;
+        size_t free = kmsg_buf_size - kmsg_head;
         if (free >= total) break;
         if (kmsg_tail) { kmsg_compact_locked(); continue; } /* recheck after compact */
         if (!kmsg_drop_oldest_locked()) { kmsg_tail = kmsg_head = 0; kmsg_syslog_seq = 0; }
-        if (kmsg_head == 0 && KMSG_BUFFER_SIZE >= total) break; /* ring emptied */
+        if (kmsg_head == 0 && kmsg_buf_size >= total) break; /* ring emptied */
     }
 
     kmsg_record_hdr_t *hdr = (kmsg_record_hdr_t *)(kmsg_buf + kmsg_head);
@@ -144,6 +151,7 @@ static void kmsg_walk(size_t from, size_t to, void (*visit)(const kmsg_record_hd
     while (from < to) {
         if (to - from < KMSG_HDR_SIZE) break;
         const kmsg_record_hdr_t *hdr = (const kmsg_record_hdr_t *)(kmsg_buf + from);
+        if (hdr->len > kmsg_buf_size - KMSG_HDR_SIZE) break;
         size_t next = kmsg_align(from + KMSG_HDR_SIZE + hdr->len);
         if (next > to) break;
         if (visit) visit(hdr, from, opaque);
@@ -245,7 +253,7 @@ size_t kmsg_unread_bytes(void)
 
 size_t kmsg_buffer_size(void)
 {
-    return KMSG_BUFFER_SIZE;
+    return kmsg_buf_size;
 }
 
 void kmsg_clear(void)
@@ -332,6 +340,8 @@ ssize_t kmsg_dev_write(const char *buf, size_t size)
 {
     if (!buf && size) return -EINVAL;
     if (!size) return 0;
+    /* printk.devkmsg=off: user logging is disabled, as in Linux. */
+    if (kmsg_devkmsg == KMSG_DEVKMSG_OFF) return -EPERM;
 
     char *copy = malloc(size + 1);
     if (!copy) return -ENOMEM;
@@ -380,24 +390,72 @@ ssize_t kmsg_dev_write(const char *buf, size_t size)
 void kmsg_init(void)
 {
     if (kmsg_ready) return;
-    kmsg_buf = malloc(KMSG_BUFFER_SIZE);
+    kmsg_buf = malloc(kmsg_buf_size);
     if (!kmsg_buf) return;
-    memset(kmsg_buf, 0, KMSG_BUFFER_SIZE);
+    memset(kmsg_buf, 0, kmsg_buf_size);
     kmsg_head = kmsg_tail = 0;
     kmsg_seq             = 0;
     kmsg_syslog_seq      = 0;
     kmsg_ready           = true;
 
-    /* Parse the loglevel= kernel command line parameter, like Linux. */
+    /* Parse the standard Linux printk command line parameters.  They are
+     * applied in command line order, so the last one wins, as with Linux
+     * early_param() handlers. */
     const char *cmdline = get_cmdline();
-    if (cmdline) {
-        const char *p = cmdline;
-        while ((p = strstr(p, "loglevel="))) {
-            p += 9;
-            if (*p >= '0' && *p <= '7') {
-                console_loglevel = *p - '0';
-                break;
+    if (!cmdline) return;
+
+    const char *p = cmdline;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        const char *tok = p;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        size_t tlen = (size_t)(p - tok);
+        if (!tlen) continue;
+
+        if (tlen == 6 && memcmp(tok, "quiet", 6) == 0) {
+            /* CONSOLE_LOGLEVEL_QUIET: KERN_WARNING (4) and above only. */
+            console_loglevel = 4;
+        } else if (tlen == 5 && memcmp(tok, "debug", 5) == 0) {
+            /* CONSOLE_LOGLEVEL_DEBUG: print everything. */
+            console_loglevel = 7;
+        } else if (tlen == 15 && memcmp(tok, "ignore_loglevel", 15) == 0) {
+            /* Ignore the loglevel setting, print all messages. */
+            ignore_loglevel = true;
+        } else if (tlen > 8 && memcmp(tok, "loglevel=", 9) == 0) {
+            char *end;
+            long  level = strtol(tok + 9, &end, 10);
+            if (end != tok + 9) console_loglevel = level < 0 ? 0 : (level > 7 ? 7 : (int)level);
+        } else if (tlen > 11 && memcmp(tok, "log_buf_len=", 12) == 0) {
+            /* Format: n[KMG]; Linux rounds up to a power of two. */
+            char *end;
+            long  n = strtol(tok + 12, &end, 10);
+            if (end != tok + 12 && n > 0) {
+                if (*end == 'K' || *end == 'k') { n <<= 10; end++; }
+                else if (*end == 'M' || *end == 'm') { n <<= 20; end++; }
+                else if (*end == 'G' || *end == 'g') { n <<= 30; end++; }
+                size_t want = (size_t)n;
+                if (want > (1u << 31)) want = (size_t)1 << 31; /* LOG_BUF_LEN_MAX */
+                if (want < 32 * 1024) want = 32 * 1024;
+                /* power of two, as Linux requires */
+                size_t size = 1;
+                while (size < want) size <<= 1;
+                if (size != kmsg_buf_size) {
+                    uint8_t *nbuf = malloc(size);
+                    if (nbuf) {
+                        free(kmsg_buf);
+                        kmsg_buf      = nbuf;
+                        kmsg_buf_size = size;
+                        memset(kmsg_buf, 0, kmsg_buf_size);
+                    }
+                }
             }
+        } else if (tlen > 11 && memcmp(tok, "printk.time=", 12) == 0) {
+            if (tok[12] == '0') printk_time = false;
+            else if (tok[12] == '1') printk_time = true;
+        } else if (tlen > 14 && memcmp(tok, "printk.devkmsg=", 15) == 0) {
+            if (memcmp(tok + 15, "on", 2) == 0) kmsg_devkmsg = KMSG_DEVKMSG_ON;
+            else if (memcmp(tok + 15, "off", 3) == 0) kmsg_devkmsg = KMSG_DEVKMSG_OFF;
+            else if (memcmp(tok + 15, "ratelimit", 9) == 0) kmsg_devkmsg = KMSG_DEVKMSG_RATELIMIT;
         }
     }
 }

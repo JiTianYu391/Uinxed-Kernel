@@ -25,14 +25,20 @@
 
 #define BUF_SIZE 2048 // least 2 bytes (1 byte is for '\0')
 
-/* Console log levels, mirroring Linux: only records with a level <=
- * console_loglevel are printed to the console, while the kmsg ring keeps
- * everything.  Controlled via /proc/sys/kernel/printk, syslog(2) and the
- * loglevel= boot parameter. */
-int console_loglevel = 6;
-int default_loglevel = 4;
-int minimum_loglevel = 1;
-int boot_loglevel    = 7;
+/* Console log levels, mirroring Linux: records with a level at or above
+ * console_loglevel are kept in the kmsg ring but not printed to the
+ * console.  Controlled via /proc/sys/kernel/printk, syslog(2) and the
+ * loglevel=/quiet/debug/ignore_loglevel boot parameters. */
+int console_loglevel = 7; /* CONSOLE_LOGLEVEL_DEFAULT: everything but KERN_DEBUG */
+int default_loglevel = 4; /* MESSAGE_LOGLEVEL_DEFAULT */
+int minimum_loglevel = 1; /* CONSOLE_LOGLEVEL_MIN */
+int boot_loglevel    = 7; /* default console loglevel */
+
+/* ignore_loglevel boot argument (Linux: prints all messages to console). */
+bool ignore_loglevel = false;
+
+/* printk.time= boot argument (Linux PRINTK_TIME, default on). */
+bool printk_time = true;
 
 /* Lock for printk */
 spinlock_t printk_lock = {
@@ -65,8 +71,9 @@ static writer klog_writer = {
 };
 
 /* Emit a fully formatted record (text must end with '\n'): store it in the
- * kmsg ring unconditionally, then print to the console when the level
- * passes the console_loglevel filter.  Used by printk() and /dev/kmsg. */
+ * kmsg ring unconditionally, then print to the console unless the level is
+ * suppressed (level >= console_loglevel, Linux's suppress_message_printing).
+ * Used by printk() and /dev/kmsg. */
 void printk_emit(int level, const char *text, size_t len)
 {
     if (!text || !len) return;
@@ -74,8 +81,18 @@ void printk_emit(int level, const char *text, size_t len)
 
     kmsg_record(level, text, len);
 
-    if (level > console_loglevel) return;
+    if (!ignore_loglevel && level >= console_loglevel) return;
     spin_lock(&printk_lock); // Lock
+    if (printk_time) {
+        /* "[   12.345678] " prefix, as Linux prints when PRINTK_TIME is on. */
+        char ts[24];
+        int  n = snprintf(ts, sizeof(ts), "[%5llu.%06llu] ",
+                          (unsigned long long)(nano_time() / 1000000000),
+                          (unsigned long long)((nano_time() / 1000) % 1000000));
+        if (n < 0) n = 0;
+        if ((size_t)n > sizeof(ts)) n = (int)sizeof(ts);
+        for (int i = 0; i < n; i++) klog_writer_handler(&klog_writer, ts[i]);
+    }
     for (size_t i = 0; i < len; i++) klog_writer_handler(&klog_writer, text[i]);
     spin_unlock(&printk_lock); // Unlock
 }
@@ -104,23 +121,22 @@ void printk(const char *format, ...)
     printk_emit(level, buf, (size_t)len);
 }
 
-/* Kernel print log (timestamped, KERN_INFO level) */
+/* Kernel print log (KERN_INFO level; timestamp added by printk_emit
+ * when printk_time is enabled, as Linux does) */
 void plogk(const char *format, ...)
 {
 #if KERNEL_LOG
-    if (!format || 6 > console_loglevel) return;
+    if (!format || (!ignore_loglevel && 6 >= console_loglevel)) return;
     spin_lock(&plogk_lock); // Lock
     char buf[BUF_SIZE];
-    int  n = snprintf(buf, sizeof(buf), "[%5d.%06d] ", (int)(nano_time() / 1000000000), (int)((nano_time() / 1000) % 1000000));
-    if (n < 0 || (size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
     va_list args;
     va_start(args, format);
-    int m = vsnprintf(buf + n, sizeof(buf) - (size_t)n, format, args);
+    int n = vsnprintf(buf, sizeof(buf), format, args);
     va_end(args);
-    if (m < 0) m = 0;
-    if ((size_t)(n + m) >= sizeof(buf)) m = (int)sizeof(buf) - 1 - n;
-    if (m && buf[n + m - 1] != '\n' && (size_t)(n + m) < sizeof(buf) - 1) buf[n + m++] = '\n';
-    printk_emit(6, buf, (size_t)(n + m));
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(buf)) n = (int)sizeof(buf) - 1;
+    if (n && buf[n - 1] != '\n' && (size_t)n < sizeof(buf) - 1) buf[n++] = '\n';
+    printk_emit(6, buf, (size_t)n);
     spin_unlock(&plogk_lock); // Unlock
 #else
     (void)format;
